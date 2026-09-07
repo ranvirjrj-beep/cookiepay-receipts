@@ -12,6 +12,7 @@
   let publicKey = null;
   let busy = false;
   let receipt = null;
+  let toastTimer = null;
 
   const $ = (id) => document.getElementById(id);
   const walletButton = $('walletButton');
@@ -38,6 +39,34 @@
     statusDot.classList.toggle('pulse', working);
   }
 
+  function showToast(message, isError = false) {
+    let toast = document.getElementById('cookiepayToast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'cookiepayToast';
+      Object.assign(toast.style, {
+        position: 'fixed',
+        top: '88px',
+        right: '24px',
+        zIndex: '9999',
+        maxWidth: '420px',
+        padding: '14px 16px',
+        borderRadius: '12px',
+        border: '1px solid #5b4a2d',
+        background: '#15120d',
+        color: '#f5efe5',
+        boxShadow: '0 16px 40px rgba(0,0,0,.35)',
+        font: '600 14px/1.45 Inter, system-ui, sans-serif',
+      });
+      document.body.appendChild(toast);
+    }
+    toast.style.borderColor = isError ? '#8a3d32' : '#5b4a2d';
+    toast.textContent = message;
+    toast.hidden = false;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toast.hidden = true; }, 6500);
+  }
+
   function setBusy(next) {
     busy = next;
     walletButton.disabled = next;
@@ -48,16 +77,17 @@
 
   function provider() {
     const nightly = window.nightly?.solana;
-    if (!nightly) throw new Error('Nightly Wallet was not detected. Install Nightly and refresh this page.');
+    if (!nightly) throw new Error('Nightly Wallet was not detected in this browser. Make sure the Nightly extension is installed, enabled for this site, and unlocked, then refresh.');
     return nightly;
   }
 
   async function switchToCookieChain() {
     const nightly = provider();
     const genesisHash = await connection.getGenesisHash();
-    if (typeof nightly.changeNetwork === 'function') {
-      await nightly.changeNetwork({ genesisHash, url: RPC_URL });
+    if (typeof nightly.changeNetwork !== 'function') {
+      throw new Error('This Nightly build cannot switch to a custom SVM network. Please update the Nightly extension.');
     }
+    await nightly.changeNetwork({ genesisHash, url: RPC_URL });
     return genesisHash;
   }
 
@@ -82,26 +112,46 @@
   }
 
   async function connectWallet() {
+    if (busy) return;
     setBusy(true);
     clearReceipt();
     try {
-      await switchToCookieChain();
       const nightly = provider();
-      const connect = nightly.features?.['standard:connect']?.connect;
-      if (typeof connect !== 'function') throw new Error('This Nightly build does not expose Wallet Standard connect.');
-      const result = await connect();
+      const connectFeature = nightly.features?.['standard:connect'];
+      if (typeof connectFeature?.connect !== 'function') {
+        throw new Error('This Nightly build does not expose Wallet Standard connect. Please update Nightly and refresh.');
+      }
+
+      setStatus('Approve the connection in Nightly…', true);
+      showToast('Nightly detected. Approve the wallet connection in the extension popup.');
+
+      // Keep the call bound to the feature object. Nightly documents connect(false)
+      // for an explicit, non-silent permission request.
+      const result = await connectFeature.connect(false);
       const nextAccount = result?.accounts?.[0];
-      if (!nextAccount?.address) throw new Error('Nightly did not return a wallet account.');
+      if (!nextAccount?.address) throw new Error('Nightly connected but did not return a wallet account.');
 
       account = nextAccount;
       publicKey = new PublicKey(nextAccount.address);
+
+      setStatus('Wallet connected. Switching Nightly to Cookie Chain…', true);
+      await switchToCookieChain();
+
       walletButton.className = 'ghost';
       walletButton.textContent = short(nextAccount.address, 4, 4);
+      walletButton.title = nextAccount.address;
       setStatus('Nightly connected to Cookie Chain.');
+      showToast('Connected to Cookie Chain successfully.');
       await refresh();
     } catch (error) {
       console.error(error);
-      setStatus(error instanceof Error ? error.message : 'Could not connect Nightly.');
+      account = null;
+      publicKey = null;
+      const message = error instanceof Error ? error.message : 'Could not connect Nightly.';
+      walletButton.className = 'primary compact';
+      walletButton.textContent = 'Connect Nightly';
+      setStatus(message);
+      showToast(message, true);
     } finally {
       setBusy(false);
     }
@@ -109,8 +159,8 @@
 
   async function disconnectWallet() {
     try {
-      const disconnect = window.nightly?.solana?.features?.['standard:disconnect']?.disconnect;
-      if (typeof disconnect === 'function') await disconnect();
+      const disconnectFeature = window.nightly?.solana?.features?.['standard:disconnect'];
+      if (typeof disconnectFeature?.disconnect === 'function') await disconnectFeature.disconnect();
     } catch (error) {
       console.warn(error);
     }
@@ -118,6 +168,7 @@
     publicKey = null;
     walletButton.className = 'primary compact';
     walletButton.textContent = 'Connect Nightly';
+    walletButton.title = '';
     balanceText.textContent = '—';
     activityContent.className = 'activityEmpty';
     activityContent.textContent = 'Connect Nightly to load the wallet’s latest Cookie Chain transactions.';
@@ -148,12 +199,13 @@
       );
 
       const nightly = provider();
-      const signTransaction = nightly.features?.['standard:signTransaction']?.signTransaction;
-      if (typeof signTransaction !== 'function') throw new Error('Nightly signTransaction is unavailable.');
+      const signFeature = nightly.features?.['standard:signTransaction'];
+      if (typeof signFeature?.signTransaction !== 'function') throw new Error('Nightly signTransaction is unavailable.');
 
       setStatus('Approve the transaction in Nightly…', true);
+      showToast('Review the recipient and amount in Nightly before approving.');
       const unsigned = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
-      const signed = await signTransaction({ account, transaction: unsigned });
+      const signed = await signFeature.signTransaction({ account, transaction: unsigned });
       const signedBytes = signed?.[0]?.signedTransaction;
       if (!(signedBytes instanceof Uint8Array)) throw new Error('Nightly did not return a signed transaction.');
 
@@ -180,10 +232,13 @@
       };
       renderReceipt();
       setStatus('Confirmed. Your verifiable Cookie Chain receipt is ready.');
+      showToast('Transaction confirmed — receipt created.');
       await refresh();
     } catch (error) {
       console.error(error);
-      setStatus(error instanceof Error ? error.message : 'Transaction failed.');
+      const message = error instanceof Error ? error.message : 'Transaction failed.';
+      setStatus(message);
+      showToast(message, true);
     } finally {
       setBusy(false);
     }
@@ -285,6 +340,12 @@
     amountInput.value = '0.001';
     setStatus('Cookie Jar selected. Review the amount, then approve only if you want to donate.');
   });
+
+  setTimeout(() => {
+    if (!window.nightly?.solana) {
+      setStatus('Nightly extension not detected yet. Install/enable Nightly for this site, unlock it, then refresh.');
+    }
+  }, 900);
 
   refresh();
 })();
