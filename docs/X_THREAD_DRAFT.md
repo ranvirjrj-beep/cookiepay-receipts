@@ -1,22 +1,19 @@
-# X thread draft — replace bracketed URLs after deployment
+# X thread — final draft
 
 1/ Most crypto payments leave you with a transaction hash.
 
 Technically proof. Practically, not a receipt.
 
-So I built CookiePay 🍪 — a tiny Cookie Chain cApp that turns a COOK transfer into human-readable, verifiable proof.
+So I built CookiePay 🍪 — a Cookie Chain cApp that turns native COOK transfers into human-readable, verifiable receipts.
 
-[DEMO CLIP]
+2/ The flow is simple:
 
-2/ Connect Nightly → enter a recipient + COOK amount → approve the transaction.
+Connect Nightly → enter a recipient + COOK amount → approve in the wallet.
 
-CookiePay handles the rest:
-• broadcasts on Cookie Chain
-• tracks confirmation
-• shows failures clearly
-• creates the receipt only after the chain confirms it
+CookiePay constructs the transfer, broadcasts it through Cookie Chain RPC, tracks confirmation, shows errors clearly, and only creates the receipt after confirmation.
 
-3/ The receipt includes:
+3/ Each confirmed receipt can include:
+
 • amount
 • sender + recipient
 • timestamp
@@ -24,18 +21,25 @@ CookiePay handles the rest:
 • transaction signature
 • direct CookieScan verification
 
-You can copy it or export the proof as JSON.
+It can also be copied or exported as JSON proof.
 
-4/ I also added a small network/wallet dashboard: live COOK balance, Cookie Chain slot, RPC latency and recent wallet activity.
+4/ I added a lightweight network + wallet dashboard too:
 
-And there’s an optional Cookie Jar preset for anyone who wants to support the ecosystem public-goods vault.
+• live COOK balance
+• current Cookie Chain slot
+• RPC latency
+• recent wallet activity
 
-5/ Under the hood, CookiePay uses Cookie Chain’s SVM RPC and Nightly Wallet for signing.
+There’s also an optional Cookie Jar preset for the ecosystem public-goods vault.
 
-The app never sees a seed phrase or private key. Approval stays inside the wallet.
+5/ Nightly integration is live-tested on the public app, including wallet detection, connection, Cookie Chain custom SVM validation, connected-address display and live balance/RPC queries.
 
-6/ Try it: https://ranvirjrj-beep.github.io/cookiepay-receipts/
-Source: https://github.com/ranvirjrj-beep/cookiepay-receipts
-Bridge / get COOK: https://hyperlane.cookiescan.io
+The project wallet used for validation is intentionally unfunded, so I’m not pretending a fake demo transaction happened.
+
+6/ CookiePay is fully open source, static-deployable and needs no backend/API key.
+
+Live app: https://ranvirjrj-beep.github.io/cookiepay-receipts/
+GitHub: https://github.com/ranvirjrj-beep/cookiepay-receipts
+Bridge: https://hyperlane.cookiescan.io
 
 Built for the Cookie Chain cApp bounty. 🍪
