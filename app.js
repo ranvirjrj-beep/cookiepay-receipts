@@ -81,14 +81,19 @@
     return nightly;
   }
 
-  async function switchToCookieChain() {
+  async function validateCookieChainNetwork() {
     const nightly = provider();
-    const genesisHash = await connection.getGenesisHash();
-    if (typeof nightly.changeNetwork !== 'function') {
-      throw new Error('This Nightly build cannot switch to a custom SVM network. Please update the Nightly extension.');
+    const targetGenesisHash = await connection.getGenesisHash();
+    const activeGenesisHash = nightly.genesisHash;
+
+    // Nightly exposes the currently selected SVM genesis hash. We validate it
+    // instead of forcing changeNetwork(), because custom SVMs may be displayed
+    // as "Unknown" by the approval UI even when the user already selected them.
+    if (activeGenesisHash && activeGenesisHash !== targetGenesisHash) {
+      throw new Error('Nightly is connected, but Cookie Chain is not the active SVM. Open Nightly → Change network → Cookie, then try again.');
     }
-    await nightly.changeNetwork({ genesisHash, url: RPC_URL });
-    return genesisHash;
+
+    return targetGenesisHash;
   }
 
   async function refresh() {
@@ -125,8 +130,6 @@
       setStatus('Approve the connection in Nightly…', true);
       showToast('Nightly detected. Approve the wallet connection in the extension popup.');
 
-      // Keep the call bound to the feature object. Nightly documents connect(false)
-      // for an explicit, non-silent permission request.
       const result = await connectFeature.connect(false);
       const nextAccount = result?.accounts?.[0];
       if (!nextAccount?.address) throw new Error('Nightly connected but did not return a wallet account.');
@@ -134,8 +137,8 @@
       account = nextAccount;
       publicKey = new PublicKey(nextAccount.address);
 
-      setStatus('Wallet connected. Switching Nightly to Cookie Chain…', true);
-      await switchToCookieChain();
+      setStatus('Wallet connected. Verifying Cookie Chain…', true);
+      await validateCookieChainNetwork();
 
       walletButton.className = 'ghost';
       walletButton.textContent = short(nextAccount.address, 4, 4);
@@ -184,7 +187,7 @@
     setBusy(true);
     clearReceipt();
     try {
-      await switchToCookieChain();
+      await validateCookieChainNetwork();
       const target = new PublicKey(recipientInput.value.trim());
       const cook = Number(amountInput.value);
       if (!Number.isFinite(cook) || cook <= 0) throw new Error('Enter a valid COOK amount greater than zero.');
@@ -327,8 +330,8 @@
   }
 
   function escapeHtml(value) {
-    return String(value).replace(/[&<>'"]/g, (char) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#039;', '"': '&quot;'
+    return String(value).replace(/[&<>'\"]/g, (char) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#039;', '\"': '&quot;'
     }[char]));
   }
 
