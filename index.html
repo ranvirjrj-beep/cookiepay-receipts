@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0d0c0a" />
+  <meta name="description" content="CookiePay — send COOK on Cookie Chain and keep a human-readable, verifiable receipt." />
+  <title>CookiePay Receipts — Cookie Chain</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="CookiePay home">
+        <span class="brandMark">🍪</span><span>CookiePay</span><small>Receipts</small>
+      </a>
+      <div class="headerActions">
+        <span class="networkPill"><i></i> Cookie Chain</span>
+        <button id="walletButton" class="primary compact">Connect Nightly</button>
+      </div>
+    </header>
+
+    <section class="hero" id="top">
+      <div>
+        <div class="eyebrow">ON-CHAIN PAYMENTS · HUMAN-READABLE PROOF</div>
+        <h1>Send COOK.<br><span>Keep the receipt.</span></h1>
+        <p>CookiePay turns a Cookie Chain transfer into a clean, verifiable payment receipt — with live confirmation and wallet activity in one place.</p>
+        <div class="heroLinks">
+          <a href="https://hyperlane.cookiescan.io" target="_blank" rel="noreferrer">Get COOK ↗</a>
+          <a href="https://cookiescan.io" target="_blank" rel="noreferrer">Open CookieScan ↗</a>
+        </div>
+      </div>
+      <div class="networkCard">
+        <div class="networkCardTitle">NETWORK PULSE</div>
+        <div class="metric"><span>RPC</span><strong id="rpcLatency">—</strong></div>
+        <div class="metric"><span>Current slot</span><strong id="slot">—</strong></div>
+        <div class="metric"><span>Wallet balance</span><strong id="balance">—</strong></div>
+        <button id="refreshButton" class="textButton">Refresh network ↻</button>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <article class="panel payPanel">
+        <div class="panelHeading">
+          <div><span class="step">01</span><h2>Create payment</h2></div>
+          <span class="tiny">Fees paid in COOK</span>
+        </div>
+        <form id="paymentForm">
+          <label>Recipient
+            <input id="recipient" placeholder="Cookie Chain wallet address" spellcheck="false" required>
+          </label>
+          <div class="amountRow">
+            <label>Amount
+              <div class="amountInput"><input id="amount" value="0.001" inputmode="decimal" required><span>COOK</span></div>
+            </label>
+            <button id="jarButton" class="jarButton" type="button">🍪 Cookie Jar<br><small>public-goods vault</small></button>
+          </div>
+          <button id="sendButton" class="primary send" type="submit" disabled>Connect Nightly to send</button>
+        </form>
+        <div id="statusBox" class="statusBox" aria-live="polite"><span id="statusDot">●</span><span id="statusText">Connect Nightly to begin.</span></div>
+      </article>
+
+      <article class="panel receiptPanel">
+        <div class="panelHeading">
+          <div><span class="step">02</span><h2>Verifiable receipt</h2></div>
+          <span id="confirmedBadge" class="confirmed" hidden>CONFIRMED</span>
+        </div>
+        <div id="receiptContent" class="emptyReceipt">
+          <div class="cookieStamp">🍪</div>
+          <h3>Your proof appears here</h3>
+          <p>After confirmation, CookiePay creates a shareable receipt linked to the transaction on CookieScan.</p>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel activityPanel">
+      <div class="panelHeading">
+        <div><span class="step">03</span><h2>Recent wallet activity</h2></div>
+        <span class="tiny">Live from Cookie Chain RPC</span>
+      </div>
+      <div id="activityContent" class="activityEmpty">Connect Nightly to load the wallet’s latest Cookie Chain transactions.</div>
+    </section>
+
+    <footer>
+      <span>Built for Cookie Chain · SVM-native · Nightly supported</span>
+      <span>CookiePay never sees or stores private keys.</span>
+    </footer>
+  </main>
+
+  <script src="https://unpkg.com/@solana/web3.js@1.98.4/lib/index.iife.min.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
