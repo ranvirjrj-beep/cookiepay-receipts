@@ -1,0 +1,62 @@
+name: Cashier Tarsnap XZ Stock Control
+
+on:
+  push:
+    branches: [cashier-tarsnap-lab]
+  workflow_dispatch:
+
+jobs:
+  stock-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc autoconf automake autoconf-archive pkg-config \
+            libssl-dev zlib1g-dev libext2fs-dev libbz2-dev liblzma-dev libacl1-dev libattr1-dev
+      - name: Build stock Tarsnap
+        run: |
+          git clone --depth=1 https://github.com/Tarsnap/tarsnap.git tarsnap-src
+          cd tarsnap-src
+          autoreconf -i
+          ./configure --disable-dependency-tracking
+          make -j2
+      - name: Generate XZ controls and run stock client
+        run: |
+          python3 - <<'PY'
+          import io, lzma, pathlib, tarfile
+          out=pathlib.Path('/tmp/xz-controls'); out.mkdir(exist_ok=True)
+          bio=io.BytesIO()
+          with tarfile.open(fileobj=bio, mode='w') as tf:
+              data=b'cashier-compression-probe\n'
+              ti=tarfile.TarInfo('x.txt'); ti.size=len(data); ti.mtime=0
+              tf.addfile(ti, io.BytesIO(data))
+          xz=lzma.compress(bio.getvalue(), format=lzma.FORMAT_XZ)
+          (out/'valid.xz').write_bytes(xz)
+          for n in [6,7,8,9,10,12,16,20,24,len(xz)-1]:
+              (out/f'trunc-{n}.xz').write_bytes(xz[:n])
+          print('valid_bytes', len(xz))
+          PY
+          set +e
+          : > /tmp/stock-results.txt
+          for f in /tmp/xz-controls/*.xz; do
+            timeout 3s ./tarsnap-src/tarsnap --no-default-config -c --dry-run @"$f" >/tmp/out.txt 2>/tmp/err.txt
+            rc=$?
+            printf '%s rc=%s\n' "$(basename "$f")" "$rc" | tee -a /tmp/stock-results.txt
+            if [ -s /tmp/err.txt ]; then sed 's/^/  stderr: /' /tmp/err.txt | head -20 | tee -a /tmp/stock-results.txt; fi
+          done
+          cat /tmp/stock-results.txt
+          # A real stock crash is signal-derived exit 128+SIGSEGV/SIGABRT or timeout 124.
+          if grep -Eq 'rc=(134|139|124)' /tmp/stock-results.txt; then
+            exit 42
+          fi
+          exit 0
+      - name: Upload control evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarsnap-xz-stock-control
+          path: /tmp/stock-results.txt
+          if-no-files-found: error
