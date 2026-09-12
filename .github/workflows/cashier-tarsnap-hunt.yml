@@ -1,0 +1,235 @@
+name: Cashier Tarsnap Sanitizer Hunt
+
+on:
+  push:
+    branches: [cashier-tarsnap-lab]
+  workflow_dispatch:
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang autoconf automake autoconf-archive pkg-config \
+            libssl-dev zlib1g-dev libext2fs-dev libbz2-dev liblzma-dev libacl1-dev libattr1-dev
+
+      - name: Checkout Tarsnap
+        run: git clone --depth=1 https://github.com/Tarsnap/tarsnap.git tarsnap-src
+
+      - name: Build Tarsnap with ASan and UBSan
+        working-directory: tarsnap-src
+        env:
+          CC: clang
+          CFLAGS: -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
+          LDFLAGS: -fsanitize=address,undefined
+        run: |
+          autoreconf -i
+          ./configure --disable-dependency-tracking
+          make -j2
+
+      - name: Build archive parser harness
+        working-directory: tarsnap-src
+        run: |
+          cat > /tmp/tar_harness.c <<'EOF'
+          #include <stdio.h>
+          #include "archive.h"
+          #include "archive_entry.h"
+
+          int main(int argc, char **argv) {
+              if (argc != 2) return 0;
+              struct archive *a = archive_read_new();
+              struct archive_entry *e = NULL;
+              if (a == NULL) return 0;
+              archive_read_support_compression_all(a);
+              archive_read_support_format_tar(a);
+              if (archive_read_open_filename(a, argv[1], 10240) != ARCHIVE_OK) {
+                  archive_read_finish(a);
+                  return 0;
+              }
+              for (;;) {
+                  int r = archive_read_next_header(a, &e);
+                  if (r == ARCHIVE_EOF) break;
+                  if (r < ARCHIVE_WARN) break;
+                  (void)archive_read_data_skip(a);
+              }
+              archive_read_finish(a);
+              return 0;
+          }
+          EOF
+          clang -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Ilibarchive /tmp/tar_harness.c libarchive/libarchive.a \
+            -lz -lbz2 -llzma -o /tmp/tar_harness
+
+      - name: Generate structured TAR PAX and GNU sparse corpus
+        run: |
+          cat > /tmp/hunt.py <<'PY'
+          import os, random, subprocess, pathlib, shutil
+
+          OUT = pathlib.Path('/tmp/tarsnap-corpus')
+          CRASH = pathlib.Path('/tmp/tarsnap-crashes')
+          OUT.mkdir(exist_ok=True)
+          CRASH.mkdir(exist_ok=True)
+
+          def octal(v, n):
+              if v < 0:
+                  return (b'-' + oct(-v)[2:].encode()).rjust(n-1, b'0') + b'\0'
+              return oct(v)[2:].encode().rjust(n-1, b'0') + b'\0'
+
+          def header(name=b'f', size=0, typeflag=b'0', link=b'', magic=b'ustar\0', version=b'00'):
+              h = bytearray(512)
+              h[0:100] = name[:100].ljust(100, b'\0')
+              h[100:108] = octal(0o644, 8)
+              h[108:116] = octal(0, 8)
+              h[116:124] = octal(0, 8)
+              h[124:136] = octal(size, 12)
+              h[136:148] = octal(0, 12)
+              h[148:156] = b'        '
+              h[156:157] = typeflag[:1]
+              h[157:257] = link[:100].ljust(100, b'\0')
+              h[257:263] = magic[:6].ljust(6, b'\0')
+              h[263:265] = version[:2].ljust(2, b'\0')
+              s = sum(h)
+              h[148:156] = (oct(s)[2:].encode().rjust(6, b'0') + b'\0 ')
+              return bytes(h)
+
+          def pad(b):
+              return b + b'\0' * ((512 - len(b) % 512) % 512)
+
+          def pax_record(key, value):
+              raw = key + b'=' + value + b'\n'
+              n = len(raw) + 3
+              while True:
+                  rec = str(n).encode() + b' ' + raw
+                  if len(rec) == n:
+                      return rec
+                  n = len(rec)
+
+          def pax_archive(records, file_size=0, file_body=b'', final_type=b'0'):
+              body = b''.join(records)
+              return (header(b'PaxHeaders/x', len(body), b'x') + pad(body) +
+                      header(b'payload', file_size, final_type) + pad(file_body[:file_size]) +
+                      b'\0' * 1024)
+
+          cases = []
+          # Baseline PAX records and deliberately odd GNU sparse ordering/bounds.
+          vals = [b'0', b'1', b'-1', b'9223372036854775807', b'9223372036854775808',
+                  b'18446744073709551615', b'999999999999999999999999999999999999']
+          for off in vals:
+              for sz in vals:
+                  cases.append(pax_archive([
+                      pax_record(b'GNU.sparse.numblocks', b'1'),
+                      pax_record(b'GNU.sparse.numbytes', sz),
+                      pax_record(b'GNU.sparse.offset', off),
+                      pax_record(b'GNU.sparse.size', b'64'),
+                      pax_record(b'path', b'x')
+                  ], 1, b'A'))
+                  cases.append(pax_archive([
+                      pax_record(b'GNU.sparse.numblocks', b'1'),
+                      pax_record(b'GNU.sparse.offset', off),
+                      pax_record(b'GNU.sparse.numbytes', sz),
+                      pax_record(b'GNU.sparse.realsize', b'64'),
+                      pax_record(b'path', b'x')
+                  ], 1, b'A'))
+
+          # GNU sparse 0.1 maps, malformed separators, counts and overflows.
+          maps = [
+              b'0,1', b'-1,1', b'0,-1', b'9223372036854775807,1',
+              b'1,9223372036854775807', b'0,1,2', b',', b'0,,1',
+              b'999999999999999999999,1', b'0,999999999999999999999',
+          ]
+          for m in maps:
+              cases.append(pax_archive([
+                  pax_record(b'GNU.sparse.map', m),
+                  pax_record(b'GNU.sparse.size', b'128'),
+                  pax_record(b'path', b'sparse')
+              ], 2, b'AB'))
+
+          # GNU sparse 1.0 metadata in entry body.
+          sparse_bodies = [
+              b'1\n0\n1\n', b'1\n-1\n1\n', b'1\n0\n-1\n', b'2147483647\n',
+              b'999999999999999999999\n', b'2\n0\n1\n1\n1\n',
+              b'#comment\n1\n0\n1\n', b'1\n0', b'1\nA\n1\n'
+          ]
+          for sb in sparse_bodies:
+              recs = [pax_record(b'GNU.sparse.major', b'1'),
+                      pax_record(b'GNU.sparse.minor', b'0'),
+                      pax_record(b'GNU.sparse.realsize', b'1024'),
+                      pax_record(b'path', b'sparse10')]
+              cases.append(pax_archive(recs, len(sb), sb))
+
+          # PAX framing mutations, including invalid UTF-8 in names/ACLs/xattrs.
+          raw_bodies = [
+              b'1 path=x\n', b'0 path=x\n', b'999999 path=x\n', b'12 path=x',
+              b'20 SCHILY.acl.access=\xff\n', b'24 SCHILY.acl.default=\xc0\n',
+              b'30 LIBARCHIVE.xattr.%FF=AAAA\n', b'18 path=\xf0\x80\x80\x80\n'
+          ]
+          for body in raw_bodies:
+              cases.append(header(b'PaxHeaders/m', len(body), b'x') + pad(body) + header(b'x', 0) + b'\0'*1024)
+
+          # Random structured PAX key/value mutations.
+          keys = [b'path', b'size', b'uid', b'gid', b'mtime', b'GNU.sparse.map',
+                  b'GNU.sparse.offset', b'GNU.sparse.numbytes', b'GNU.sparse.realsize',
+                  b'SCHILY.realsize', b'SCHILY.acl.access', b'LIBARCHIVE.xattr.a']
+          alphabet = bytes(range(256))
+          rnd = random.Random(0xC451E2)
+          for _ in range(1200):
+              rs = []
+              for _ in range(rnd.randint(1, 8)):
+                  k = rnd.choice(keys)
+                  mode = rnd.randrange(5)
+                  if mode == 0:
+                      v = str(rnd.choice([0,1,-1,2**31-1,2**63-1,2**63,10**30])).encode()
+                  elif mode == 1:
+                      v = bytes(rnd.choice(alphabet) for _ in range(rnd.randint(0, 24)))
+                  elif mode == 2:
+                      v = b'0,1,' * rnd.randint(1, 12)
+                  elif mode == 3:
+                      v = b'A' * rnd.randint(0, 300)
+                  else:
+                      v = b'user::rwx,' + bytes([rnd.randrange(256)])
+                  rs.append(pax_record(k, v))
+              cases.append(pax_archive(rs, rnd.randint(0, 8), b'ABCDEFGH'))
+
+          env = dict(os.environ)
+          env['ASAN_OPTIONS'] = 'abort_on_error=1:detect_leaks=0:symbolize=1'
+          env['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
+          interesting = 0
+          for i, data in enumerate(cases):
+              p = OUT / f'case-{i:05d}.tar'
+              p.write_bytes(data)
+              try:
+                  r = subprocess.run(['/tmp/tar_harness', str(p)], env=env,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     timeout=1.5)
+              except subprocess.TimeoutExpired:
+                  continue
+              err = r.stderr.decode('utf-8', 'replace')
+              if ('AddressSanitizer' in err or 'UndefinedBehaviorSanitizer' in err or
+                  'runtime error:' in err or 'SEGV' in err):
+                  interesting += 1
+                  shutil.copy2(p, CRASH / p.name)
+                  (CRASH / (p.name + '.stderr.txt')).write_text(err)
+                  print('SANITIZER HIT', p.name)
+                  print(err[:4000])
+                  if interesting >= 20:
+                      break
+          print(f'TOTAL_CASES={len(cases)} SANITIZER_HITS={interesting}')
+          if interesting:
+              raise SystemExit(42)
+          PY
+          python /tmp/hunt.py | tee /tmp/hunt-summary.txt
+
+      - name: Upload hunt evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarsnap-sanitizer-hunt
+          path: |
+            /tmp/hunt-summary.txt
+            /tmp/tarsnap-crashes
+          if-no-files-found: ignore
