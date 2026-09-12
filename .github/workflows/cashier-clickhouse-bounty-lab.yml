@@ -1,0 +1,126 @@
+name: Cashier ClickHouse bounty lab
+
+on:
+  push:
+    branches: [cashier-clickhouse-lab]
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - clickhouse/clickhouse-server:latest
+          - clickhouse/clickhouse-server:head
+    steps:
+      - name: Pull official ClickHouse image
+        run: docker pull "${{ matrix.image }}"
+
+      - name: Start unmodified server
+        run: |
+          docker run -d --name ch \
+            --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_SKIP_USER_SETUP=1 \
+            "${{ matrix.image }}"
+          for i in $(seq 1 90); do
+            if docker exec ch clickhouse-client -q "SELECT 1" >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker exec ch clickhouse-client -q "SELECT version(), buildId()"
+
+      - name: Prepare stable non-experimental corpus
+        run: |
+          cat > /tmp/setup.sql <<'SQL'
+          DROP TABLE IF EXISTS fuzz_a;
+          DROP TABLE IF EXISTS fuzz_b;
+          CREATE TABLE fuzz_a
+          (
+            id UInt64,
+            s String,
+            n Nullable(Int64),
+            a Array(Int32),
+            m Map(String, Int64),
+            t Tuple(UInt8, String),
+            lc LowCardinality(String),
+            d Decimal64(3),
+            dt DateTime64(3)
+          ) ENGINE = MergeTree ORDER BY id;
+          INSERT INTO fuzz_a SELECT
+            number,
+            toString(number % 17),
+            if(number % 7 = 0, NULL, toInt64(number) - 250),
+            [toInt32(number % 5), -toInt32(number % 3), 0],
+            map('x', toInt64(number), 'y', -toInt64(number)),
+            (toUInt8(number % 255), toString(number % 11)),
+            toString(number % 13),
+            toDecimal64((toInt64(number) - 250) / 7.0, 3),
+            toDateTime64('2024-01-01 00:00:00', 3) + number / 10
+          FROM numbers(500);
+          CREATE TABLE fuzz_b (id UInt64, v Int64, tag String) ENGINE = MergeTree ORDER BY id;
+          INSERT INTO fuzz_b SELECT number * 2, toInt64(number) - 100, toString(number % 9) FROM numbers(300);
+          SQL
+          docker exec -i ch clickhouse-client --multiquery < /tmp/setup.sql
+
+          cat > /tmp/seeds.sql <<'SQL'
+          SELECT id, arrayMap(x -> x * 2, a), arrayFilter(x -> x <= 0, a) FROM fuzz_a WHERE id < 100 ORDER BY id LIMIT 30
+          SELECT id, mapKeys(m), mapValues(m), m['x'] - m['y'] FROM fuzz_a WHERE id % 3 = 0 LIMIT 30
+          SELECT id, tupleElement(t, 1), tupleElement(t, 2), n FROM fuzz_a WHERE n IS NOT NULL ORDER BY n LIMIT 30
+          SELECT lc, count(), uniqExact(s), sumOrNull(n) FROM fuzz_a GROUP BY lc ORDER BY count() DESC LIMIT 20
+          SELECT a.id, b.v, a.n, b.tag FROM fuzz_a AS a LEFT JOIN fuzz_b AS b USING id WHERE a.id < 150 ORDER BY a.id LIMIT 50
+          SELECT id, row_number() OVER (PARTITION BY s ORDER BY id), sum(id) OVER (PARTITION BY lc ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) FROM fuzz_a WHERE id < 120
+          SELECT s, sum(id), count() FROM fuzz_a GROUP BY GROUPING SETS ((s), ()) ORDER BY s LIMIT 30
+          SELECT id, arrayJoin(a) AS x FROM fuzz_a WHERE id < 60 AND x <= 1 ORDER BY id, x LIMIT 100
+          SELECT id, ifNull(n, -999), coalesce(n, toInt64(id)), greatest(ifNull(n, 0), toInt64(id)) FROM fuzz_a WHERE id < 100
+          SELECT id, reinterpretAsUInt64(toFloat64(id)), bitXor(id, id >> 1), cityHash64(s) FROM fuzz_a WHERE id < 100
+          SELECT id, toString(dt), toUnixTimestamp64Milli(dt), formatDateTime(dt, '%F %T') FROM fuzz_a WHERE id < 100
+          SELECT id, d, round(d, 2), floor(d, 1), ceil(d, 1) FROM fuzz_a WHERE id < 120 ORDER BY d LIMIT 50
+          SELECT id, s FROM fuzz_a WHERE s IN (SELECT tag FROM fuzz_b WHERE id < 100) ORDER BY id LIMIT 50
+          SELECT countIf(n < 0), quantiles(0.1, 0.5, 0.9)(id), groupArray(20)(s) FROM fuzz_a
+          SELECT id, multiIf(id % 3 = 0, 'a', id % 3 = 1, 'b', 'c'), transform(toUInt8(id % 3), [0,1,2], ['x','y','z'], 'q') FROM fuzz_a WHERE id < 100
+          SQL
+
+      - name: Run built-in AST query fuzzer and detect server death
+        shell: bash
+        run: |
+          set +e
+          : > /tmp/fuzz.log
+          crash=0
+          seed_no=0
+          while IFS= read -r q; do
+            seed_no=$((seed_no+1))
+            echo "===== SEED $seed_no =====" | tee -a /tmp/fuzz.log
+            echo "$q" | tee -a /tmp/fuzz.log
+            timeout 180 docker exec ch clickhouse-client \
+              --query "$q" \
+              --query-fuzzer-runs 120 \
+              --max_execution_time 3 \
+              --max_memory_usage 1073741824 \
+              --max_result_rows 10000 \
+              --result_overflow_mode break \
+              >> /tmp/fuzz.log 2>&1
+            rc=$?
+            if ! docker exec ch clickhouse-client -q "SELECT 1" >/dev/null 2>&1; then
+              echo "SERVER_DEAD_AFTER_SEED=$seed_no CLIENT_RC=$rc" | tee -a /tmp/fuzz.log
+              crash=1
+              break
+            fi
+          done < /tmp/seeds.sql
+
+          echo "===== SERVER LOG TAIL =====" >> /tmp/fuzz.log
+          docker logs --tail 600 ch >> /tmp/fuzz.log 2>&1
+          cp /tmp/fuzz.log "clickhouse-fuzz-${{ strategy.job-index }}.log"
+          if [ "$crash" -eq 1 ]; then
+            echo "A server crash/death was detected. Preserving logs."
+            exit 2
+          fi
+
+      - name: Upload fuzz logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clickhouse-fuzz-${{ strategy.job-index }}
+          path: clickhouse-fuzz-${{ strategy.job-index }}.log
+          retention-days: 7
