@@ -1,0 +1,142 @@
+name: Cashier Tarsnap Compression ASan Hunt
+
+on:
+  push:
+    branches: [cashier-tarsnap-lab]
+  workflow_dispatch:
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang autoconf automake autoconf-archive pkg-config \
+            libssl-dev zlib1g-dev libext2fs-dev libbz2-dev liblzma-dev libacl1-dev libattr1-dev
+      - name: Build Tarsnap with ASan only
+        run: |
+          git clone --depth=1 https://github.com/Tarsnap/tarsnap.git tarsnap-src
+          cd tarsnap-src
+          autoreconf -i
+          CC=clang CFLAGS='-O1 -g -fsanitize=address -fno-omit-frame-pointer' \
+            LDFLAGS='-fsanitize=address' ./configure --disable-dependency-tracking
+          make -j2
+      - name: Build all-filter harness
+        working-directory: tarsnap-src
+        run: |
+          cat >/tmp/filter_harness.c <<'EOF'
+          #include <stdio.h>
+          #include "archive.h"
+          #include "archive_entry.h"
+          int main(int argc, char **argv) {
+            struct archive *a; struct archive_entry *e = NULL; int r;
+            char buf[32768];
+            if (argc != 2) return 2;
+            a = archive_read_new();
+            if (!a) return 2;
+            archive_read_support_compression_all(a);
+            archive_read_support_format_all(a);
+            r = archive_read_open_filename(a, argv[1], 10240);
+            if (r != ARCHIVE_OK) { archive_read_finish(a); return 0; }
+            for (;;) {
+              r = archive_read_next_header(a, &e);
+              if (r == ARCHIVE_EOF) break;
+              if (r < ARCHIVE_WARN) break;
+              for (;;) {
+                r = (int)archive_read_data(a, buf, sizeof(buf));
+                if (r <= 0) break;
+              }
+              if (r < 0) break;
+            }
+            archive_read_finish(a);
+            return 0;
+          }
+          EOF
+          clang -O1 -g -fsanitize=address -fno-omit-frame-pointer \
+            -Ilibarchive /tmp/filter_harness.c libarchive/libarchive.a \
+            -lz -lbz2 -llzma -o /tmp/filter_harness
+      - name: Run deterministic compression mutations
+        run: |
+          cat >/tmp/hunt.py <<'PY'
+          import bz2, gzip, lzma, os, pathlib, random, shutil, struct, subprocess, tarfile, io
+          ROOT=pathlib.Path('/tmp/corpus'); ROOT.mkdir(exist_ok=True)
+          HITS=pathlib.Path('/tmp/hits'); HITS.mkdir(exist_ok=True)
+          bio=io.BytesIO()
+          with tarfile.open(fileobj=bio, mode='w') as tf:
+            data=b'cashier-asan-probe\n'; ti=tarfile.TarInfo('x.txt'); ti.size=len(data); ti.mtime=0
+            tf.addfile(ti, io.BytesIO(data))
+          tar=bio.getvalue()
+          seeds={'gzip':gzip.compress(tar,9,mtime=0),'bzip2':bz2.compress(tar,9),
+                 'xz':lzma.compress(tar,format=lzma.FORMAT_XZ),'lzma':lzma.compress(tar,format=lzma.FORMAT_ALONE)}
+          cases=[]
+          def add(n,d): cases.append((n,bytes(d)))
+          for kind,s in seeds.items():
+            add(kind+'-valid',s)
+            for n in sorted(set(list(range(0,min(64,len(s))))+[max(0,len(s)-i) for i in range(0,65)])):
+              add(f'{kind}-trunc-{n}',s[:n])
+            for rep in [2,3,8]: add(f'{kind}-concat-{rep}',s*rep)
+            add(kind+'-prefix-junk',b'JUNK'+s); add(kind+'-suffix-junk',s+b'JUNK')
+          gz=seeds['gzip']; raw=gz[10:-8]; trailer=gz[-8:]
+          for n in [0,1,2,3,4,8,16,31,32,63,64,127,255,256,1024,4096,16384,65535]:
+            h=bytearray(gz[:10]); h[3]|=4; extra=bytes((i*73+19)&255 for i in range(n))
+            add(f'gzip-fextra-{n}',bytes(h)+struct.pack('<H',n)+extra+raw+trailer)
+            if n: add(f'gzip-fextra-{n}-short',bytes(h)+struct.pack('<H',n)+extra[:-1])
+          for length in [0,1,8,255,4096,65535]:
+            for flag,label,ch in [(8,'fname',b'N'),(16,'comment',b'C')]:
+              h=bytearray(gz[:10]); h[3]|=flag
+              add(f'gzip-{label}-{length}',bytes(h)+ch*length+b'\0'+raw+trailer)
+          h=bytearray(gz[:10]); h[3]|=4|8|16|2
+          add('gzip-all-optionals',bytes(h)+b'\x02\x00XYn\0c\0\x00\x00'+raw+trailer)
+          rnd=random.Random(0xA5A52026)
+          for kind,s in seeds.items():
+            for i in range(1200):
+              b=bytearray(s); mode=rnd.randrange(10)
+              if mode==0 and b:
+                for _ in range(rnd.randint(1,12)): b[rnd.randrange(len(b))]^=1<<rnd.randrange(8)
+              elif mode==1 and b:
+                j=rnd.randrange(len(b)); del b[j:j+rnd.randint(1,min(64,len(b)-j))]
+              elif mode==2:
+                j=rnd.randrange(len(b)+1); b[j:j]=bytes(rnd.randrange(256) for _ in range(rnd.randint(1,64)))
+              elif mode==3 and b:
+                j=rnd.randrange(len(b)); q=rnd.randint(1,min(64,len(b)-j)); b[j:j+q]=b'\x00'*q
+              elif mode==4 and len(b)>12:
+                j=rnd.randrange(4,len(b)-4); b[j:j+4]=rnd.choice([b'\xff'*4,b'\x00'*4,b'\x7f\xff\xff\xff',b'\x80\x00\x00\x00'])
+              elif mode==5: b += bytes(rnd.randrange(256) for _ in range(rnd.randint(1,128)))
+              elif mode==6 and len(b)>8: b=b[:rnd.randrange(1,len(b))]
+              elif mode==7 and b:
+                j=rnd.randrange(len(b)); b[j:j]=b[j:j+rnd.randint(1,min(32,len(b)-j))]*rnd.randint(2,8)
+              elif mode==8 and len(b)>16:
+                j=rnd.randrange(8,len(b)-8); b[j:j+8]=rnd.choice([b'\xff'*8,b'\x00'*8])
+              else:
+                b=bytearray(b[:min(len(b),rnd.randint(1,128))])
+              add(f'{kind}-mut-{i:04d}',b)
+          env=dict(os.environ); env['ASAN_OPTIONS']='abort_on_error=1:detect_leaks=0:symbolize=1'
+          summary=[]; hits=0; hangs=0
+          for idx,(name,data) in enumerate(cases):
+            p=ROOT/f'{idx:05d}-{name}.bin'; p.write_bytes(data)
+            try:
+              r=subprocess.run(['/tmp/filter_harness',str(p)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,timeout=1.0)
+            except subprocess.TimeoutExpired:
+              hangs+=1; summary.append(f'HANG {p.name} bytes={len(data)}'); continue
+            err=r.stderr.decode('utf-8','replace')
+            if 'AddressSanitizer' in err or r.returncode < 0:
+              hits+=1; shutil.copy2(p,HITS/p.name); (HITS/(p.name+'.stderr.txt')).write_text(err)
+              summary.append(f'HIT {p.name} rc={r.returncode} bytes={len(data)}\n{err[:7000]}')
+              if hits>=30: break
+          summary.append(f'TOTAL={len(cases)} HITS={hits} HANGS={hangs}')
+          pathlib.Path('/tmp/asan-summary.txt').write_text('\n\n'.join(summary)); print('\n\n'.join(summary[-40:]))
+          if hits: raise SystemExit(42)
+          PY
+          python /tmp/hunt.py
+      - name: Upload ASan evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarsnap-compression-asan
+          path: |
+            /tmp/asan-summary.txt
+            /tmp/hits
+          if-no-files-found: ignore
